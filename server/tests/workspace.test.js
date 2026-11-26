@@ -6,6 +6,7 @@ let mockUsers = [];
 let mockWorkspaces = [];
 let mockWorkspaceMembers = [];
 let membershipFailureError = null;
+let listWorkspacesFailureError = null;
 
 const createTxClient = () => ({
   workspaces: {
@@ -94,6 +95,45 @@ vi.mock('../src/config/prisma.js', () => ({
         return result;
       }),
     },
+    workspace_members: {
+      findMany: vi.fn(async ({ where, orderBy, select } = {}) => {
+        if (listWorkspacesFailureError) {
+          throw listWorkspacesFailureError;
+        }
+
+        let results = mockWorkspaceMembers.filter((m) => {
+          if (where?.user_id && m.user_id !== where.user_id) return false;
+          return true;
+        });
+
+        if (orderBy?.joined_at === 'desc') {
+          results = [...results].sort(
+            (a, b) => new Date(b.joined_at).getTime() - new Date(a.joined_at).getTime()
+          );
+        }
+
+        return results.map((m) => {
+          const item = {};
+          if (select?.role) item.role = m.role;
+          if (select?.joined_at) item.joined_at = m.joined_at;
+          if (select?.workspaces) {
+            const ws = mockWorkspaces.find((w) => w.id === m.workspace_id);
+            if (ws) {
+              const wsSelect = select.workspaces.select || {};
+              const wsResult = {};
+              if (wsSelect.id) wsResult.id = ws.id;
+              if (wsSelect.name) wsResult.name = ws.name;
+              if (wsSelect.description) wsResult.description = ws.description;
+              if (wsSelect.created_by) wsResult.created_by = ws.created_by;
+              if (wsSelect.created_at) wsResult.created_at = ws.created_at;
+              if (wsSelect.updated_at) wsResult.updated_at = ws.updated_at;
+              item.workspaces = wsResult;
+            }
+          }
+          return item;
+        });
+      }),
+    },
     $transaction: vi.fn(async (callback) => {
       // Snapshot state to simulate database rollback if transaction fails
       const workspacesSnapshot = [...mockWorkspaces];
@@ -129,6 +169,7 @@ describe('POST /api/workspaces', () => {
     mockWorkspaces = [];
     mockWorkspaceMembers = [];
     membershipFailureError = null;
+    listWorkspacesFailureError = null;
     vi.clearAllMocks();
 
     authenticatedAgent = request.agent(app);
@@ -330,5 +371,170 @@ describe('POST /api/workspaces', () => {
 
       errorSpy.mockRestore();
     });
+  });
+});
+
+describe('GET /api/workspaces', () => {
+  const userOne = {
+    fullName: 'Alice Builder',
+    email: 'alice.list@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  const userTwo = {
+    fullName: 'Bob Collaborator',
+    email: 'bob.list@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  let aliceAgent;
+  let aliceUser;
+  let bobAgent;
+  let bobUser;
+
+  beforeEach(async () => {
+    mockUsers = [];
+    mockWorkspaces = [];
+    mockWorkspaceMembers = [];
+    membershipFailureError = null;
+    listWorkspacesFailureError = null;
+    vi.clearAllMocks();
+
+    aliceAgent = request.agent(app);
+    const aliceReg = await aliceAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(userOne);
+    aliceUser = aliceReg.body.data.user;
+
+    bobAgent = request.agent(app);
+    const bobReg = await bobAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(userTwo);
+    bobUser = bobReg.body.data.user;
+  });
+
+  it('should reject unauthenticated requests with 401 Unauthorized', async () => {
+    const response = await request(app).get('/api/workspaces');
+
+    expect(response.status).toBe(401);
+    expect(response.body.status).toBe('fail');
+    expect(response.body.message).toBe('Authentication required. Please log in.');
+    expect(prisma.workspace_members.findMany).not.toHaveBeenCalled();
+  });
+
+  it('should return an empty array when the authenticated user belongs to no workspaces', async () => {
+    const response = await aliceAgent.get('/api/workspaces');
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('success');
+    expect(response.body.message).toBe('Workspaces retrieved successfully.');
+    expect(response.body.data.workspaces).toEqual([]);
+  });
+
+  it('should return workspaces the authenticated user belongs to along with membership roles and metadata', async () => {
+    // Alice creates a workspace (role: owner)
+    const createdRes = await aliceAgent
+      .post('/api/workspaces')
+      .set('Origin', 'http://localhost:5173')
+      .send({
+        name: 'Alice Core Team',
+        description: 'Main workspace owned by Alice',
+      });
+    const ownedWorkspace = createdRes.body.data.workspace;
+
+    // Seed a second workspace owned by Bob where Alice is a member (role: member)
+    const sharedWorkspaceId = 'ws-shared-1';
+    const sharedCreatedAt = new Date('2026-11-26T15:00:00.000Z');
+    const sharedJoinedAt = new Date('2026-11-26T15:10:00.000Z');
+
+    mockWorkspaces.push({
+      id: sharedWorkspaceId,
+      name: 'Bob Shared Project',
+      description: null,
+      created_by: bobUser.id,
+      created_at: sharedCreatedAt,
+      updated_at: sharedCreatedAt,
+    });
+    mockWorkspaceMembers.push({
+      workspace_id: sharedWorkspaceId,
+      user_id: aliceUser.id,
+      role: 'member',
+      joined_at: sharedJoinedAt,
+    });
+
+    const response = await aliceAgent.get('/api/workspaces');
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('success');
+
+    const { workspaces } = response.body.data;
+    expect(workspaces).toHaveLength(2);
+
+    const ownerEntry = workspaces.find((w) => w.id === ownedWorkspace.id);
+    expect(ownerEntry).toMatchObject({
+      id: ownedWorkspace.id,
+      name: 'Alice Core Team',
+      description: 'Main workspace owned by Alice',
+      createdBy: aliceUser.id,
+      role: 'owner',
+    });
+    expect(ownerEntry.createdAt).toBeDefined();
+    expect(ownerEntry.updatedAt).toBeDefined();
+    expect(ownerEntry.joinedAt).toBeDefined();
+
+    const memberEntry = workspaces.find((w) => w.id === sharedWorkspaceId);
+    expect(memberEntry).toEqual({
+      id: sharedWorkspaceId,
+      name: 'Bob Shared Project',
+      description: null,
+      createdBy: bobUser.id,
+      createdAt: sharedCreatedAt.toISOString(),
+      updatedAt: sharedCreatedAt.toISOString(),
+      role: 'member',
+      joinedAt: sharedJoinedAt.toISOString(),
+    });
+  });
+
+  it('should isolate workspaces per user so one user cannot see another user’s private workspaces', async () => {
+    // Alice creates a private workspace
+    await aliceAgent
+      .post('/api/workspaces')
+      .set('Origin', 'http://localhost:5173')
+      .send({ name: 'Alice Secret Workspace' });
+
+    // Bob creates his own workspace
+    const bobCreateRes = await bobAgent
+      .post('/api/workspaces')
+      .set('Origin', 'http://localhost:5173')
+      .send({ name: 'Bob Private Workspace' });
+
+    const bobListRes = await bobAgent.get('/api/workspaces');
+
+    expect(bobListRes.status).toBe(200);
+    expect(bobListRes.body.data.workspaces).toHaveLength(1);
+    expect(bobListRes.body.data.workspaces[0].id).toBe(bobCreateRes.body.data.workspace.id);
+    expect(bobListRes.body.data.workspaces[0].name).toBe('Bob Private Workspace');
+    expect(
+      bobListRes.body.data.workspaces.some((w) => w.name === 'Alice Secret Workspace')
+    ).toBe(false);
+  });
+
+  it('should return a sanitized 500 error without leaking internal database details when query fails', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    listWorkspacesFailureError = new Error(
+      'ECONNREFUSED: PostgreSQL relation "workspace_members" failed at pg_pool'
+    );
+
+    const response = await aliceAgent.get('/api/workspaces');
+
+    expect(response.status).toBe(500);
+    expect(response.body.status).toBe('error');
+    expect(response.body.message).toBe('Unable to retrieve workspaces. Please try again later.');
+    expect(response.body.message).not.toMatch(/ECONNREFUSED|PostgreSQL|workspace_members|pg_pool/i);
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
   });
 });

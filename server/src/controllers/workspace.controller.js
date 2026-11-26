@@ -76,3 +76,61 @@ export const createWorkspace = async (req, res, next) => {
     return next(safeError);
   }
 };
+
+/**
+ * List all workspaces the authenticated user belongs to.
+ * GET /api/workspaces
+ */
+export const listMyWorkspaces = async (req, res, next) => {
+  const userId = req.user.id;
+
+  try {
+    const memberships = await prisma.workspace_members.findMany({
+      where: {
+        user_id: userId,
+      },
+      orderBy: {
+        joined_at: 'desc',
+      },
+      select: {
+        role: true,
+        joined_at: true,
+        workspaces: {
+          select: {
+            id: true,
+            name: true,
+            description: true,
+            created_by: true,
+            created_at: true,
+            updated_at: true,
+          },
+        },
+      },
+    });
+
+    const workspaces = memberships.map((membership) => ({
+      id: membership.workspaces.id,
+      name: membership.workspaces.name,
+      description: membership.workspaces.description,
+      createdBy: membership.workspaces.created_by,
+      createdAt: membership.workspaces.created_at,
+      updatedAt: membership.workspaces.updated_at,
+      role: membership.role,
+      joinedAt: membership.joined_at,
+    }));
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'Workspaces retrieved successfully.',
+      data: {
+        workspaces,
+      },
+    });
+  } catch (error) {
+    console.error('[Workspace Controller Error] Failed to list workspaces:', error);
+
+    const safeError = new Error('Unable to retrieve workspaces. Please try again later.');
+    safeError.statusCode = 500;
+    return next(safeError);
+  }
+};
