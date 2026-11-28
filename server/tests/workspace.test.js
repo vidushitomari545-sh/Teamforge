@@ -7,6 +7,7 @@ let mockWorkspaces = [];
 let mockWorkspaceMembers = [];
 let membershipFailureError = null;
 let listWorkspacesFailureError = null;
+let getWorkspaceFailureError = null;
 
 const createTxClient = () => ({
   workspaces: {
@@ -95,6 +96,69 @@ vi.mock('../src/config/prisma.js', () => ({
         return result;
       }),
     },
+    workspaces: {
+      findFirst: vi.fn(async ({ where, select } = {}) => {
+        if (getWorkspaceFailureError) {
+          throw getWorkspaceFailureError;
+        }
+
+        const ws = mockWorkspaces.find((w) => {
+          if (where?.id && w.id !== where.id) return false;
+          const requiredMemberId = where?.workspace_members?.some?.user_id;
+          if (requiredMemberId) {
+            const hasMember = mockWorkspaceMembers.some(
+              (m) => m.workspace_id === w.id && m.user_id === requiredMemberId
+            );
+            if (!hasMember) return false;
+          }
+          return true;
+        });
+
+        if (!ws) return null;
+
+        const result = {};
+        if (select?.id) result.id = ws.id;
+        if (select?.name) result.name = ws.name;
+        if (select?.description) result.description = ws.description;
+        if (select?.created_by) result.created_by = ws.created_by;
+        if (select?.created_at) result.created_at = ws.created_at;
+        if (select?.updated_at) result.updated_at = ws.updated_at;
+
+        if (select?.workspace_members) {
+          const memberConfig = select.workspace_members;
+          let members = mockWorkspaceMembers.filter((m) => m.workspace_id === ws.id);
+
+          if (memberConfig.orderBy?.joined_at === 'asc') {
+            members = [...members].sort(
+              (a, b) => new Date(a.joined_at).getTime() - new Date(b.joined_at).getTime()
+            );
+          }
+
+          result.workspace_members = members.map((m) => {
+            const mSelect = memberConfig.select || {};
+            const mResult = {};
+            if (mSelect.user_id) mResult.user_id = m.user_id;
+            if (mSelect.role) mResult.role = m.role;
+            if (mSelect.joined_at) mResult.joined_at = m.joined_at;
+            if (mSelect.users) {
+              const user = mockUsers.find((u) => u.id === m.user_id);
+              if (user) {
+                const uSelect = mSelect.users.select || {};
+                const uResult = {};
+                if (uSelect.id) uResult.id = user.id;
+                if (uSelect.full_name) uResult.full_name = user.full_name;
+                if (uSelect.email) uResult.email = user.email;
+                if (uSelect.password_hash) uResult.password_hash = user.password_hash;
+                mResult.users = uResult;
+              }
+            }
+            return mResult;
+          });
+        }
+
+        return result;
+      }),
+    },
     workspace_members: {
       findMany: vi.fn(async ({ where, orderBy, select } = {}) => {
         if (listWorkspacesFailureError) {
@@ -170,6 +234,7 @@ describe('POST /api/workspaces', () => {
     mockWorkspaceMembers = [];
     membershipFailureError = null;
     listWorkspacesFailureError = null;
+    getWorkspaceFailureError = null;
     vi.clearAllMocks();
 
     authenticatedAgent = request.agent(app);
@@ -398,6 +463,7 @@ describe('GET /api/workspaces', () => {
     mockWorkspaceMembers = [];
     membershipFailureError = null;
     listWorkspacesFailureError = null;
+    getWorkspaceFailureError = null;
     vi.clearAllMocks();
 
     aliceAgent = request.agent(app);
@@ -533,6 +599,193 @@ describe('GET /api/workspaces', () => {
     expect(response.body.status).toBe('error');
     expect(response.body.message).toBe('Unable to retrieve workspaces. Please try again later.');
     expect(response.body.message).not.toMatch(/ECONNREFUSED|PostgreSQL|workspace_members|pg_pool/i);
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
+  });
+});
+
+describe('GET /api/workspaces/:workspaceId', () => {
+  const userOne = {
+    fullName: 'Alice Owner',
+    email: 'alice.detail@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  const userTwo = {
+    fullName: 'Bob Member',
+    email: 'bob.detail@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  const userThree = {
+    fullName: 'Charlie Outsider',
+    email: 'charlie.detail@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  let aliceAgent;
+  let aliceUser;
+  let bobAgent;
+  let bobUser;
+  let charlieAgent;
+  let workspaceId;
+
+  beforeEach(async () => {
+    mockUsers = [];
+    mockWorkspaces = [];
+    mockWorkspaceMembers = [];
+    membershipFailureError = null;
+    listWorkspacesFailureError = null;
+    getWorkspaceFailureError = null;
+    vi.clearAllMocks();
+
+    aliceAgent = request.agent(app);
+    const aliceReg = await aliceAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(userOne);
+    aliceUser = aliceReg.body.data.user;
+
+    bobAgent = request.agent(app);
+    const bobReg = await bobAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(userTwo);
+    bobUser = bobReg.body.data.user;
+
+    charlieAgent = request.agent(app);
+    await charlieAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(userThree);
+
+    // Alice creates a workspace
+    const createRes = await aliceAgent
+      .post('/api/workspaces')
+      .set('Origin', 'http://localhost:5173')
+      .send({
+        name: 'Platform Engineering',
+        description: 'Core architecture team',
+      });
+    workspaceId = createRes.body.data.workspace.id;
+
+    // Add Bob as a member of Alice's workspace
+    mockWorkspaceMembers.push({
+      workspace_id: workspaceId,
+      user_id: bobUser.id,
+      role: 'member',
+      joined_at: new Date('2026-11-28T10:00:00.000Z'),
+    });
+  });
+
+  it('should reject unauthenticated requests with 401 Unauthorized', async () => {
+    const response = await request(app).get(`/api/workspaces/${workspaceId}`);
+
+    expect(response.status).toBe(401);
+    expect(response.body.status).toBe('fail');
+    expect(response.body.message).toBe('Authentication required. Please log in.');
+    expect(prisma.workspaces.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('should allow owner access and return workspace details with sanitized member list', async () => {
+    const response = await aliceAgent.get(`/api/workspaces/${workspaceId}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('success');
+    expect(response.body.message).toBe('Workspace retrieved successfully.');
+
+    const { workspace } = response.body.data;
+    expect(workspace).toMatchObject({
+      id: workspaceId,
+      name: 'Platform Engineering',
+      description: 'Core architecture team',
+      createdBy: aliceUser.id,
+      role: 'owner',
+    });
+    expect(workspace.createdAt).toBeDefined();
+    expect(workspace.updatedAt).toBeDefined();
+    expect(workspace.joinedAt).toBeDefined();
+
+    expect(workspace.members).toHaveLength(2);
+    expect(workspace.members).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          userId: aliceUser.id,
+          fullName: 'Alice Owner',
+          email: 'alice.detail@example.com',
+          role: 'owner',
+        }),
+        expect.objectContaining({
+          userId: bobUser.id,
+          fullName: 'Bob Member',
+          email: 'bob.detail@example.com',
+          role: 'member',
+        }),
+      ])
+    );
+    // Password hashes must never be exposed in member objects
+    workspace.members.forEach((m) => {
+      expect(m.password_hash).toBeUndefined();
+      expect(m.password).toBeUndefined();
+    });
+  });
+
+  it('should allow member access and return workspace details with members', async () => {
+    const response = await bobAgent.get(`/api/workspaces/${workspaceId}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe('success');
+
+    const { workspace } = response.body.data;
+    expect(workspace.id).toBe(workspaceId);
+    expect(workspace.name).toBe('Platform Engineering');
+    expect(workspace.role).toBe('member');
+    expect(workspace.members).toHaveLength(2);
+  });
+
+  it('should return 404 Not Found when authenticated user is not a member of the workspace', async () => {
+    const response = await charlieAgent.get(`/api/workspaces/${workspaceId}`);
+
+    expect(response.status).toBe(404);
+    expect(response.body.status).toBe('fail');
+    expect(response.body.message).toBe('Workspace not found.');
+    expect(response.body.data).toBeUndefined();
+  });
+
+  it('should return 404 Not Found for a nonexistent workspace or invalid UUID error', async () => {
+    const response = await aliceAgent.get(
+      '/api/workspaces/00000000-0000-0000-0000-000000000000'
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.body.status).toBe('fail');
+    expect(response.body.message).toBe('Workspace not found.');
+
+    // Simulate PostgreSQL invalid UUID syntax (Prisma P2023)
+    const p2023Error = new Error('Inconsistent column data: invalid input syntax for type uuid');
+    p2023Error.code = 'P2023';
+    getWorkspaceFailureError = p2023Error;
+
+    const invalidUuidResponse = await aliceAgent.get('/api/workspaces/not-a-uuid');
+
+    expect(invalidUuidResponse.status).toBe(404);
+    expect(invalidUuidResponse.body.status).toBe('fail');
+    expect(invalidUuidResponse.body.message).toBe('Workspace not found.');
+  });
+
+  it('should return a sanitized 500 error without leaking internal database details when query fails', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    getWorkspaceFailureError = new Error(
+      'ECONNREFUSED: PostgreSQL relation "workspaces" failed at pg_pool'
+    );
+
+    const response = await aliceAgent.get(`/api/workspaces/${workspaceId}`);
+
+    expect(response.status).toBe(500);
+    expect(response.body.status).toBe('error');
+    expect(response.body.message).toBe('Unable to retrieve workspace. Please try again later.');
+    expect(response.body.message).not.toMatch(/ECONNREFUSED|PostgreSQL|workspaces|pg_pool/i);
     expect(errorSpy).toHaveBeenCalled();
 
     errorSpy.mockRestore();
