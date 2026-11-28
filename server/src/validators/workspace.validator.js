@@ -17,3 +17,16 @@ export const createWorkspaceSchema = z.strictObject({
     .nullish()
     .transform((val) => (val && val.length > 0 ? val : null)),
 });
+
+/**
+ * Request body validation schema for adding an existing registered user to a workspace.
+ * Uses strictObject to reject any unexpected fields (e.g. role, user_id, workspace_id).
+ */
+export const addWorkspaceMemberSchema = z.strictObject({
+  email: z
+    .string({ message: 'Email is required' })
+    .trim()
+    .email('Invalid email address format')
+    .max(255, 'Email must not exceed 255 characters')
+    .toLowerCase(),
+});

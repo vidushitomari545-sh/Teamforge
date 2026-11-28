@@ -8,9 +8,54 @@ let mockWorkspaceMembers = [];
 let membershipFailureError = null;
 let listWorkspacesFailureError = null;
 let getWorkspaceFailureError = null;
+let addMemberFailureError = null;
+let bypassDuplicateCheckUserId = null;
+
+const findMockUser = ({ where, select }) => {
+  const user = mockUsers.find((u) => {
+    if (where.email && u.email.toLowerCase() === where.email.toLowerCase()) return true;
+    if (where.id && u.id === where.id) return true;
+    return false;
+  });
+
+  if (!user) return null;
+
+  const result = {};
+  if (select?.id) result.id = user.id;
+  if (select?.full_name) result.full_name = user.full_name;
+  if (select?.email) result.email = user.email;
+  if (select?.password_hash) result.password_hash = user.password_hash;
+  if (select?.created_at) result.created_at = user.created_at;
+  return result;
+};
 
 const createTxClient = () => ({
+  users: {
+    findUnique: vi.fn(async ({ where, select }) => {
+      if (addMemberFailureError) {
+        throw addMemberFailureError;
+      }
+      return findMockUser({ where, select });
+    }),
+  },
   workspaces: {
+    findUnique: vi.fn(async ({ where, select }) => {
+      if (addMemberFailureError) {
+        throw addMemberFailureError;
+      }
+
+      const ws = mockWorkspaces.find((w) => w.id === where?.id);
+      if (!ws) return null;
+
+      const result = {};
+      if (select?.id) result.id = ws.id;
+      if (select?.name) result.name = ws.name;
+      if (select?.description) result.description = ws.description;
+      if (select?.created_by) result.created_by = ws.created_by;
+      if (select?.created_at) result.created_at = ws.created_at;
+      if (select?.updated_at) result.updated_at = ws.updated_at;
+      return result;
+    }),
     create: vi.fn(async ({ data, select }) => {
       const now = new Date('2026-11-26T14:30:00.000Z');
       const newWorkspace = {
@@ -34,9 +79,47 @@ const createTxClient = () => ({
     }),
   },
   workspace_members: {
+    findUnique: vi.fn(async ({ where, select }) => {
+      if (addMemberFailureError) {
+        throw addMemberFailureError;
+      }
+
+      const composite = where?.workspace_id_user_id;
+      if (!composite) return null;
+
+      if (bypassDuplicateCheckUserId && composite.user_id === bypassDuplicateCheckUserId) {
+        bypassDuplicateCheckUserId = null;
+        return null;
+      }
+
+      const membership = mockWorkspaceMembers.find(
+        (m) => m.workspace_id === composite.workspace_id && m.user_id === composite.user_id
+      );
+
+      if (!membership) return null;
+
+      const result = {};
+      if (select?.workspace_id) result.workspace_id = membership.workspace_id;
+      if (select?.user_id) result.user_id = membership.user_id;
+      if (select?.role) result.role = membership.role;
+      if (select?.joined_at) result.joined_at = membership.joined_at;
+      return result;
+    }),
     create: vi.fn(async ({ data, select }) => {
       if (membershipFailureError) {
         throw membershipFailureError;
+      }
+
+      // Enforce composite primary key (workspace_id, user_id) like PostgreSQL
+      const duplicate = mockWorkspaceMembers.some(
+        (m) => m.workspace_id === data.workspace_id && m.user_id === data.user_id
+      );
+      if (duplicate) {
+        const p2002Error = new Error(
+          'Unique constraint failed on the fields: (`workspace_id`,`user_id`)'
+        );
+        p2002Error.code = 'P2002';
+        throw p2002Error;
       }
 
       const newMembership = {
@@ -61,23 +144,7 @@ vi.mock('../src/config/prisma.js', () => ({
   prisma: {
     $queryRaw: vi.fn().mockResolvedValue([{ '?column?': 1 }]),
     users: {
-      findUnique: vi.fn(async ({ where, select }) => {
-        const user = mockUsers.find((u) => {
-          if (where.email && u.email.toLowerCase() === where.email.toLowerCase()) return true;
-          if (where.id && u.id === where.id) return true;
-          return false;
-        });
-
-        if (!user) return null;
-
-        const result = {};
-        if (select?.id) result.id = user.id;
-        if (select?.full_name) result.full_name = user.full_name;
-        if (select?.email) result.email = user.email;
-        if (select?.password_hash) result.password_hash = user.password_hash;
-        if (select?.created_at) result.created_at = user.created_at;
-        return result;
-      }),
+      findUnique: vi.fn(async ({ where, select }) => findMockUser({ where, select })),
       create: vi.fn(async ({ data, select }) => {
         const newUser = {
           id: 'user-' + Math.random().toString(36).substring(2, 9),
@@ -789,5 +856,294 @@ describe('GET /api/workspaces/:workspaceId', () => {
     expect(errorSpy).toHaveBeenCalled();
 
     errorSpy.mockRestore();
+  });
+});
+
+describe('POST /api/workspaces/:workspaceId/members', () => {
+  const ownerInput = {
+    fullName: 'Alice Owner',
+    email: 'alice.add@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  const memberInput = {
+    fullName: 'Bob Member',
+    email: 'bob.add@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  const candidateInput = {
+    fullName: 'Charlie Candidate',
+    email: 'charlie.add@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  const outsiderInput = {
+    fullName: 'Dana Outsider',
+    email: 'dana.add@example.com',
+    password: 'StrongPassword123!',
+  };
+
+  let aliceAgent;
+  let bobAgent;
+  let bobUser;
+  let charlieUser;
+  let danaAgent;
+  let workspaceId;
+
+  beforeEach(async () => {
+    mockUsers = [];
+    mockWorkspaces = [];
+    mockWorkspaceMembers = [];
+    membershipFailureError = null;
+    listWorkspacesFailureError = null;
+    getWorkspaceFailureError = null;
+    addMemberFailureError = null;
+    bypassDuplicateCheckUserId = null;
+    vi.clearAllMocks();
+
+    aliceAgent = request.agent(app);
+    await aliceAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(ownerInput);
+
+    bobAgent = request.agent(app);
+    const bobReg = await bobAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(memberInput);
+    bobUser = bobReg.body.data.user;
+
+    const charlieReg = await request(app)
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(candidateInput);
+    charlieUser = charlieReg.body.data.user;
+
+    danaAgent = request.agent(app);
+    await danaAgent
+      .post('/api/auth/register')
+      .set('Origin', 'http://localhost:5173')
+      .send(outsiderInput);
+
+    const createRes = await aliceAgent
+      .post('/api/workspaces')
+      .set('Origin', 'http://localhost:5173')
+      .send({ name: 'TeamForge Core' });
+    workspaceId = createRes.body.data.workspace.id;
+
+    // Seed Bob as an existing 'member' (not owner) in Alice's workspace
+    mockWorkspaceMembers.push({
+      workspace_id: workspaceId,
+      user_id: bobUser.id,
+      role: 'member',
+      joined_at: new Date('2026-11-28T10:00:00.000Z'),
+    });
+
+    vi.clearAllMocks();
+  });
+
+  describe('Authentication & CSRF', () => {
+    it('should reject unauthenticated requests with 401 Unauthorized', async () => {
+      const response = await request(app)
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email });
+
+      expect(response.status).toBe(401);
+      expect(response.body.status).toBe('fail');
+      expect(response.body.message).toBe('Authentication required. Please log in.');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('should reject requests from untrusted origins with 403 Forbidden', async () => {
+      const response = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'https://untrusted.example')
+        .send({ email: charlieUser.email });
+
+      expect(response.status).toBe(403);
+      expect(response.body.status).toBe('fail');
+      expect(response.body.message).toMatch(/CSRF verification failed/i);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Request validation', () => {
+    it('should reject missing or invalid email with 400 Bad Request', async () => {
+      const missingRes = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({});
+
+      expect(missingRes.status).toBe(400);
+      expect(missingRes.body.status).toBe('fail');
+      expect(missingRes.body.errors).toHaveProperty('email');
+
+      const invalidRes = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: 'not-an-email' });
+
+      expect(invalidRes.status).toBe(400);
+      expect(invalidRes.body.errors).toHaveProperty('email');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('should reject unexpected client fields such as role, user_id, or workspace_id', async () => {
+      const withRole = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email, role: 'owner' });
+
+      expect(withRole.status).toBe(400);
+      expect(withRole.body.status).toBe('fail');
+      expect(withRole.body.message).toMatch(/Unrecognized key/i);
+
+      const withUserId = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email, user_id: charlieUser.id, workspace_id: workspaceId });
+
+      expect(withUserId.status).toBe(400);
+      expect(withUserId.body.message).toMatch(/Unrecognized key/i);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Authorization & business rules', () => {
+    it('should allow workspace owner to add an existing registered user with normalized email and member role', async () => {
+      const response = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: '  CHARLIE.ADD@EXAMPLE.COM  ' });
+
+      expect(response.status).toBe(201);
+      expect(response.body.status).toBe('success');
+      expect(response.body.message).toBe('Workspace member added successfully.');
+
+      const { member } = response.body.data;
+      expect(member).toMatchObject({
+        workspaceId,
+        userId: charlieUser.id,
+        fullName: 'Charlie Candidate',
+        email: 'charlie.add@example.com',
+        role: 'member',
+      });
+      expect(member.joinedAt).toBeDefined();
+      expect(member.password_hash).toBeUndefined();
+      expect(member.password).toBeUndefined();
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(mockWorkspaceMembers).toHaveLength(3);
+      expect(
+        mockWorkspaceMembers.find((m) => m.user_id === charlieUser.id)?.role
+      ).toBe('member');
+    });
+
+    it('should forbid a workspace member without owner role from adding another user (403)', async () => {
+      const response = await bobAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email });
+
+      expect(response.status).toBe(403);
+      expect(response.body.status).toBe('fail');
+      expect(response.body.message).toBe('Only workspace owners can add members.');
+      expect(mockWorkspaceMembers).toHaveLength(2);
+    });
+
+    it('should reject a non-member trying to add a user with 404 Not Found', async () => {
+      const response = await danaAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email });
+
+      expect(response.status).toBe(404);
+      expect(response.body.status).toBe('fail');
+      expect(response.body.message).toBe('Workspace not found.');
+      expect(mockWorkspaceMembers).toHaveLength(2);
+    });
+
+    it('should return 404 Not Found for an unknown workspace or invalid UUID', async () => {
+      const response = await aliceAgent
+        .post('/api/workspaces/00000000-0000-0000-0000-000000000000/members')
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email });
+
+      expect(response.status).toBe(404);
+      expect(response.body.status).toBe('fail');
+      expect(response.body.message).toBe('Workspace not found.');
+
+      const p2023Error = new Error('Invalid UUID syntax');
+      p2023Error.code = 'P2023';
+      addMemberFailureError = p2023Error;
+
+      const invalidIdRes = await aliceAgent
+        .post('/api/workspaces/not-a-uuid/members')
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email });
+
+      expect(invalidIdRes.status).toBe(404);
+      expect(invalidIdRes.body.message).toBe('Workspace not found.');
+    });
+
+    it('should return 404 Not Found when target user email is not registered', async () => {
+      const response = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: 'missing@example.com' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.status).toBe('fail');
+      expect(response.body.message).toBe('User with this email was not found.');
+      expect(mockWorkspaceMembers).toHaveLength(2);
+    });
+
+    it('should return 409 Conflict for duplicate membership (both pre-check and DB P2002 race)', async () => {
+      // Case 1: Caught by application-level lookup inside transaction
+      const precheckRes = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: memberInput.email });
+
+      expect(precheckRes.status).toBe(409);
+      expect(precheckRes.body.status).toBe('fail');
+      expect(precheckRes.body.message).toBe('User is already a member of this workspace.');
+      expect(mockWorkspaceMembers).toHaveLength(2);
+
+      // Case 2: Concurrent race reaching composite PK (workspace_id, user_id) -> Prisma P2002
+      bypassDuplicateCheckUserId = bobUser.id;
+      const raceRes = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: memberInput.email });
+
+      expect(raceRes.status).toBe(409);
+      expect(raceRes.body.status).toBe('fail');
+      expect(raceRes.body.message).toBe('User is already a member of this workspace.');
+      expect(mockWorkspaceMembers).toHaveLength(2);
+    });
+
+    it('should return a sanitized 500 error without leaking internal database details on unexpected failure', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      addMemberFailureError = new Error(
+        'ECONNREFUSED: PostgreSQL relation "workspace_members" constraint failure'
+      );
+
+      const response = await aliceAgent
+        .post(`/api/workspaces/${workspaceId}/members`)
+        .set('Origin', 'http://localhost:5173')
+        .send({ email: charlieUser.email });
+
+      expect(response.status).toBe(500);
+      expect(response.body.status).toBe('error');
+      expect(response.body.message).toBe('Unable to add workspace member. Please try again later.');
+      expect(response.body.message).not.toMatch(/ECONNREFUSED|PostgreSQL|workspace_members/i);
+      expect(errorSpy).toHaveBeenCalled();
+
+      errorSpy.mockRestore();
+    });
   });
 });

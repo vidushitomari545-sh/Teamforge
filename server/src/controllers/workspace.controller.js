@@ -233,3 +233,147 @@ export const getWorkspaceById = async (req, res, next) => {
     return next(safeError);
   }
 };
+
+const createClientError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.isOperational = true;
+  return error;
+};
+
+/**
+ * Add an existing registered user to a workspace with the 'member' role.
+ * Restricted exclusively to users holding the 'owner' role in that workspace.
+ * POST /api/workspaces/:workspaceId/members
+ */
+export const addWorkspaceMember = async (req, res, next) => {
+  const { workspaceId } = req.params;
+  const { email } = req.body;
+  const requesterId = req.user.id;
+
+  try {
+    const { member, targetUser } = await prisma.$transaction(async (tx) => {
+      // 1. Verify workspace exists
+      const workspace = await tx.workspaces.findUnique({
+        where: { id: workspaceId },
+        select: { id: true },
+      });
+
+      if (!workspace) {
+        throw createClientError(404, 'Workspace not found.');
+      }
+
+      // 2. Verify requester membership & owner role (non-members get 404 to prevent ID enumeration)
+      const requesterMembership = await tx.workspace_members.findUnique({
+        where: {
+          workspace_id_user_id: {
+            workspace_id: workspaceId,
+            user_id: requesterId,
+          },
+        },
+        select: { role: true },
+      });
+
+      if (!requesterMembership) {
+        throw createClientError(404, 'Workspace not found.');
+      }
+
+      if (requesterMembership.role !== 'owner') {
+        throw createClientError(403, 'Only workspace owners can add members.');
+      }
+
+      // 3. Look up target registered user by normalized email
+      const foundUser = await tx.users.findUnique({
+        where: { email },
+        select: {
+          id: true,
+          full_name: true,
+          email: true,
+        },
+      });
+
+      if (!foundUser) {
+        throw createClientError(404, 'User with this email was not found.');
+      }
+
+      // 4. Reject duplicate membership cleanly before insert (DB composite PK also guards races)
+      const existingMembership = await tx.workspace_members.findUnique({
+        where: {
+          workspace_id_user_id: {
+            workspace_id: workspaceId,
+            user_id: foundUser.id,
+          },
+        },
+        select: { user_id: true },
+      });
+
+      if (existingMembership) {
+        throw createClientError(409, 'User is already a member of this workspace.');
+      }
+
+      // 5. Persist membership with hardcoded 'member' role
+      const createdMembership = await tx.workspace_members.create({
+        data: {
+          workspace_id: workspaceId,
+          user_id: foundUser.id,
+          role: 'member',
+        },
+        select: {
+          workspace_id: true,
+          user_id: true,
+          role: true,
+          joined_at: true,
+        },
+      });
+
+      return {
+        member: createdMembership,
+        targetUser: foundUser,
+      };
+    });
+
+    return res.status(201).json({
+      status: 'success',
+      message: 'Workspace member added successfully.',
+      data: {
+        member: {
+          workspaceId: member.workspace_id,
+          userId: member.user_id,
+          fullName: targetUser.full_name,
+          email: targetUser.email,
+          role: member.role,
+          joinedAt: member.joined_at,
+        },
+      },
+    });
+  } catch (error) {
+    if (error?.isOperational) {
+      return res.status(error.statusCode).json({
+        status: 'fail',
+        message: error.message,
+      });
+    }
+
+    // Handle database-level composite PK duplicate race (workspace_id, user_id)
+    if (error?.code === 'P2002') {
+      return res.status(409).json({
+        status: 'fail',
+        message: 'User is already a member of this workspace.',
+      });
+    }
+
+    // PostgreSQL invalid UUID syntax surfaces as Prisma P2023; treat as not found
+    if (error?.code === 'P2023') {
+      return res.status(404).json({
+        status: 'fail',
+        message: 'Workspace not found.',
+      });
+    }
+
+    console.error('[Workspace Controller Error] Failed to add workspace member:', error);
+
+    const safeError = new Error('Unable to add workspace member. Please try again later.');
+    safeError.statusCode = 500;
+    return next(safeError);
+  }
+};

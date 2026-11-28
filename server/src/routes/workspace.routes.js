@@ -3,11 +3,15 @@ import {
   createWorkspace,
   listMyWorkspaces,
   getWorkspaceById,
+  addWorkspaceMember,
 } from '../controllers/workspace.controller.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
 import { csrfProtection } from '../middleware/csrfProtection.js';
 import { validate } from '../middleware/validate.js';
-import { createWorkspaceSchema } from '../validators/workspace.validator.js';
+import {
+  createWorkspaceSchema,
+  addWorkspaceMemberSchema,
+} from '../validators/workspace.validator.js';
 
 const router = Router();
 
@@ -19,5 +23,14 @@ router.get('/:workspaceId', requireAuth, getWorkspaceById);
 
 // Create a new workspace (Authenticated + CSRF protected)
 router.post('/', csrfProtection, requireAuth, validate(createWorkspaceSchema), createWorkspace);
+
+// Add an existing registered user to a workspace (Owner only, Authenticated + CSRF protected)
+router.post(
+  '/:workspaceId/members',
+  csrfProtection,
+  requireAuth,
+  validate(addWorkspaceMemberSchema),
+  addWorkspaceMember
+);
 
 export default router;
